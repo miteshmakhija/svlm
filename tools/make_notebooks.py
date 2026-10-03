@@ -19,14 +19,31 @@ REPO = '/content/svlm-catalogue'                # working copy on Colab's fast l
 os.environ['SVLM_ROOT'] = SVLM_ROOT
 os.makedirs(SVLM_ROOT, exist_ok=True)
 
-if not os.path.exists(REPO):
-    if os.path.exists(REPO_ON_DRIVE):
-        subprocess.run(['cp', '-r', REPO_ON_DRIVE, REPO], check=True)
-    else:
-        from google.colab import files
-        print('Repo not found on Drive. Upload svlm-catalogue.zip:')
-        up = files.upload()
-        subprocess.run(['unzip', '-q', next(iter(up)), '-d', '/content'], check=True)
+def _find_repo():
+    """Return the first folder that looks like the repo (has configs/ and svlm/), searching
+    Colab's local disk and Drive, including one extra nesting level from zip/folder uploads."""
+    bases = ['/content/svlm-catalogue', REPO_ON_DRIVE, '/content/drive/MyDrive/svlm-catalogue', '/content']
+    for b in bases:
+        for cand in (b, os.path.join(b, 'svlm-catalogue')):
+            if os.path.isdir(os.path.join(cand, 'configs')) and os.path.isdir(os.path.join(cand, 'svlm')):
+                return cand
+    return None
+
+found = _find_repo()
+if found is None:
+    from google.colab import files
+    print('Repo not found. Upload svlm-catalogue.zip (from C:\\projects\\TechFest):')
+    up = files.upload()
+    subprocess.run(['unzip', '-q', '-o', next(iter(up)), '-d', '/content'], check=True)
+    found = _find_repo()
+    assert found, 'zip did not contain the svlm-catalogue folder'
+if found.startswith('/content/drive'):
+    # work from a copy on Colab's local disk: faster, and Drive stays the clean source
+    subprocess.run(['rm', '-rf', REPO], check=True)
+    subprocess.run(['cp', '-r', found, REPO], check=True)
+    found = REPO
+REPO = found
+print('repo:', REPO)
 os.chdir(REPO)
 sys.path.insert(0, REPO)
 
