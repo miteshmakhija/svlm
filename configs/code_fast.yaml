@@ -1,0 +1,103 @@
+# msci-code-fast — inline code completion (fill-in-the-middle)
+# T4 tier. Every path is relative to the run root (SVLM_ROOT env var, default below).
+
+name: msci-code-fast
+version: 0.1.0
+tier: t4
+task: fim
+seed: 42
+owner: Mitesh Makhija
+
+paths:
+  root: /content/drive/MyDrive/svlm        # overridden by $SVLM_ROOT
+  model_store: model_store                  # relative to root unless absolute
+
+student:
+  # FIM needs a completion-style checkpoint. Qwen's FIM examples use the base coder models,
+  # so this one model deliberately starts from the base checkpoint rather than -Instruct.
+  model: Qwen/Qwen2.5-Coder-0.5B
+  load_in_4bit: false        # 0.5B fits comfortably in fp16 on a T4
+  max_seq_len: 1024
+
+teacher:
+  model: Qwen/Qwen2.5-Coder-7B   # swap for Qwen/Qwen2.5-Coder-14B if time allows (~2x slower)
+  load_in_4bit: true             # bitsandbytes NF4, fp16 compute (T4 has no bf16)
+  backend: hf                    # hf | vllm  (vllm optional, see notebook 00)
+  gen:
+    temperature: 0.0             # greedy for FIM
+    max_new_tokens: 128
+    batch_size: 16
+  logits:
+    top_k: 20
+    batch_size: 4
+
+data:
+  sources:                       # permissively licensed, pinned to a tag
+    - repo: https://github.com/pandas-dev/pandas
+      ref: v2.2.3
+      license: BSD-3-Clause
+      include: ["pandas/core/*.py", "pandas/core/**/*.py"]
+    - repo: https://github.com/numpy/numpy
+      ref: v2.1.3
+      license: BSD-3-Clause
+      include: ["numpy/lib/*.py", "numpy/_core/*.py"]
+    - repo: https://github.com/scikit-learn/scikit-learn
+      ref: 1.5.2
+      license: BSD-3-Clause
+      include: ["sklearn/linear_model/*.py", "sklearn/preprocessing/*.py", "sklearn/metrics/*.py"]
+    - repo: https://github.com/psf/requests
+      ref: v2.32.3
+      license: Apache-2.0
+      include: ["src/requests/*.py"]
+  exclude: ["**/tests/**", "**/test_*.py", "**/conftest.py", "**/_version.py"]
+  max_file_bytes: 80000
+  fim:
+    n_train: 7500
+    n_heldout: 500
+    span_mix: {line: 0.40, block: 0.35, function_body: 0.25}
+    max_middle_lines: 12
+    max_prefix_chars: 2200        # ~640 tokens
+    max_suffix_chars: 900         # ~256 tokens
+  teacher_augment_fraction: 0.25  # share of train spans also completed by the teacher
+  accept_similarity: 0.5          # teacher completion kept if it parses and is this close to the original
+  decontam:
+    ngram: 13
+    eval_sets: [humaneval, mbpp]
+
+train:
+  use_unsloth: auto               # auto | true | false
+  sft:
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    learning_rate: 2.0e-4
+    epochs: 1
+    per_device_batch: 8
+    grad_accum: 4
+    warmup_ratio: 0.03
+    save_steps: 100
+  kd:
+    alpha: 0.5                    # weight on cross-entropy; (1-alpha) on top-k KL
+    temperature: 1.0
+    learning_rate: 1.0e-4
+    epochs: 1
+    per_device_batch: 8
+    grad_accum: 4
+    save_steps: 100
+
+eval:
+  gen_batch_size: 32
+  max_new_tokens: 64
+  humaneval: true                 # via evalplus; skipped with a warning if unavailable
+  latency_prompts: 50
+
+gates:
+  quality_vs_teacher: 0.85        # student edit-similarity >= 85% of teacher's
+  beats_base: true
+  min_parse_rate: 0.98
+  max_ttft_ms_t4: 150
+
+quantise:
+  gguf_outtype: q8_0              # q8_0 needs no llama.cpp build; q4_k_m builds llama-quantize
+  awq: false                      # 0.5B is served fp16 on GPU; AWQ adds nothing here

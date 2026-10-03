@@ -1,0 +1,4 @@
+# Optional faster teacher backend (teacher.backend: vllm).
+# vLLM pins its own torch build, so install it in a FRESH Colab runtime used only for the
+# teacher_generate step, then restart before training. Check notebook 00's vLLM cell first.
+vllm>=0.11

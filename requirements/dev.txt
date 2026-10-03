@@ -1,0 +1,13 @@
+# Local development / CI on CPU: unit tests, e2e dry run with tiny models, KFP compile.
+torch
+transformers>=4.56,<6
+peft>=0.17
+accelerate>=1.10
+datasets>=3.0
+tokenizers
+pyyaml>=6.0
+numpy
+pytest
+nbformat
+kfp>=2.9
+kfp-kubernetes>=1.3

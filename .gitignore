@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+# run outputs and weights never go in git
+runs/
+cache/
+model_store/
+*.gguf
+*.safetensors
+*.npz
