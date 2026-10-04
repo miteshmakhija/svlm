@@ -24,7 +24,8 @@ def run(run: Run) -> dict:
     try:
         adapter = train(model, tok, feats, out, cfg["train"]["sft"], cfg.get("seed", 42))
     finally:
-        free_gpu(model)
+        model = None
+        free_gpu()
     info = {"adapter": str(adapter), "n_examples": len(feats)}
     write_json(out / "summary.json", info)
     return info

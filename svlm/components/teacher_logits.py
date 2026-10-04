@@ -87,8 +87,8 @@ def run(run: Run) -> dict:
             n_tokens += sum(len(r[0]) for r in results)
             log.info("teacher_logits shard %d done", si + 1)
     finally:
-        if model is not None:
-            free_gpu(model)
+        model = None
+        free_gpu()
     info = {"n_examples": len(feats), "top_k": k, "new_target_tokens": n_tokens}
     write_json(out / "summary.json", info)
     return info

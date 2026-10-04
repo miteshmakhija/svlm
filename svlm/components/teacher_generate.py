@@ -35,7 +35,8 @@ class _HFGenerator:
         return out
 
     def close(self):
-        free_gpu(self.model)
+        self.model = None
+        free_gpu()
 
 
 class _VLLMGenerator:
@@ -55,7 +56,8 @@ class _VLLMGenerator:
         return [r.outputs[0].text for r in res]
 
     def close(self):
-        free_gpu(self.llm)
+        self.llm = None
+        free_gpu()
 
 
 def make_generator(cfg: dict):

@@ -49,7 +49,8 @@ def eval_variant(cfg: dict, adapter: Path | None, held: list[dict], files: dict,
     rows = [{"id": h["id"], "span_type": h["span_type"], "pred": p, **score(p, h, files[h["file_id"]])} for h, p in zip(held, preds)]
     write_jsonl(pred_path, rows)
     lat = measure_ttft(model, tok, held[: e.get("latency_prompts", 50)]) if name == "final" else None
-    free_gpu(model)
+    model = None
+    free_gpu()
     s = _summarise(rows)
     if lat:
         s["latency"] = lat

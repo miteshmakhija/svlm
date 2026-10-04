@@ -22,21 +22,27 @@ def gpu_info() -> dict:
         "name": p.name,
         "capability": f"{p.major}.{p.minor}",
         "memory_gb": round(p.total_memory / 1e9, 1),
-        "bf16_supported": torch.cuda.is_bf16_supported(),
+        "bf16_supported": torch.cuda.is_bf16_supported(including_emulation=False),
     }
 
 
 def compute_dtype() -> torch.dtype:
     if not torch.cuda.is_available():
         return torch.float32  # CPU tests / dry runs
-    if torch.cuda.is_bf16_supported():
+    # including_emulation=False: recent torch reports bf16 on T4 (sm_75) via slow emulation
+    if torch.cuda.is_bf16_supported(including_emulation=False):
         return torch.bfloat16  # L4/A100: use bf16 automatically
     return torch.float16       # T4
 
 
 def free_gpu(*objs) -> None:
-    for o in objs:
-        del o
+    """Collect garbage and return cached CUDA memory to the driver.
+
+    Passing objects here cannot free them: the caller still holds its own reference. Drop those
+    first (`model = None` / `del model`); otherwise the weights stay resident and the next
+    `device_map="auto"` load sees a full GPU and tries to offload to CPU.
+    """
+    del objs
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -182,6 +188,7 @@ def merge_and_save(cfg: dict, adapter_dir: str | Path, out_dir: str | Path) -> P
     merged = PeftModel.from_pretrained(base, str(adapter_dir)).merge_and_unload()
     merged.save_pretrained(out_dir, safe_serialization=True)
     load_tokenizer(cfg["student"]["model"]).save_pretrained(out_dir)
-    free_gpu(base, merged)
+    base = merged = None
+    free_gpu()
     log.info("merged model saved to %s", out_dir)
     return out_dir

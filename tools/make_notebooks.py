@@ -51,11 +51,13 @@ locks = sorted(glob.glob(f'{SVLM_ROOT}/env/lock-colab-*.txt'))
 REQ = locks[-1] if locks else 'requirements/colab.txt'
 print('installing from', REQ)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-r', REQ], check=True)
+# Colab preinstalls an old torchao; recent peft refuses to build LoRA layers while it is present (unused here)
+subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-q', '-y', 'torchao'], check=False)
 
 import torch
 assert torch.cuda.is_available(), 'No GPU: Runtime > Change runtime type > T4 GPU'
 p = torch.cuda.get_device_properties(0)
-print(f'GPU: {p.name} | compute {p.major}.{p.minor} | {p.total_memory/1e9:.1f} GB | bf16: {torch.cuda.is_bf16_supported()}')
+print(f'GPU: {p.name} | compute {p.major}.{p.minor} | {p.total_memory/1e9:.1f} GB | bf16: {torch.cuda.is_bf16_supported(including_emulation=False)}')
 '''
 
 
@@ -129,7 +131,9 @@ print(f'batch of 16: {n_new} new tokens in {dt:.1f}s -> {n_new/dt:.0f} tokens/s 
 print('--- sample completion ---')
 print(outs[0].split('<|endoftext|>')[0])
 TEACHER_TOK_PER_S = n_new / dt
-free_gpu(teacher)
+# drop the notebook's own references, or the kernel keeps ~5.5 GB and the pipeline OOMs
+del teacher, outs
+free_gpu()
 '''),
         md("""
 ## 3 · Full pipeline, tiny data, real models

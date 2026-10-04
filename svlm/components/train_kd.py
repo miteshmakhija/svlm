@@ -35,7 +35,8 @@ def run(run: Run) -> dict:
     try:
         adapter = train(model, tok, feats, out, kd, cfg.get("seed", 42), kd={"alpha": kd["alpha"], "temperature": kd["temperature"]}, k=k)
     finally:
-        free_gpu(model)
+        model = None
+        free_gpu()
     info = {"adapter": str(adapter), "n_examples": len(feats), "alpha": kd["alpha"], "temperature": kd["temperature"]}
     write_json(out / "summary.json", info)
     return info

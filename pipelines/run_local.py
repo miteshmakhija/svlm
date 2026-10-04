@@ -72,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
             traceback.print_exc()
             log.error("step %s failed; fix and re-run (finished steps are kept)", step)
             return 1
+        finally:
+            # step locals are gone now; release their GPU memory before the next step loads a model
+            from svlm.modeling import free_gpu
+
+            free_gpu()
         run.mark_done(step, {"seconds": round(time.time() - t0, 1), "info": info})
     status(run)
     return 0
