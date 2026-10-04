@@ -22,7 +22,7 @@ os.makedirs(SVLM_ROOT, exist_ok=True)
 def _find_repo():
     """Return the first folder that looks like the repo (has configs/ and svlm/), searching
     Colab's local disk and Drive, including one extra nesting level from zip/folder uploads."""
-    bases = ['/content/svlm-catalogue', REPO_ON_DRIVE, '/content/drive/MyDrive/svlm-catalogue', '/content']
+    bases = ['/content/svlm-catalogue', REPO_ON_DRIVE, '/content/drive/MyDrive/svlm-catalogue', '/content/svlm', '/content']
     for b in bases:
         for cand in (b, os.path.join(b, 'svlm-catalogue')):
             if os.path.isdir(os.path.join(cand, 'configs')) and os.path.isdir(os.path.join(cand, 'svlm')):
