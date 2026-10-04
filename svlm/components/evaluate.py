@@ -9,11 +9,13 @@ import json
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import torch
 
+from .. import tasks
 from ..config import Run
 from ..fim import fim_prompt, score, trim_completion
 from ..modeling import free_gpu, generate_batch, load_student_for_inference, merge_and_save
@@ -34,12 +36,27 @@ def _summarise(rows: list[dict]) -> dict:
     return out
 
 
+def _cache_key(e: dict, adapter: Path | None, n: int) -> dict:
+    """What the cached predictions depend on; a mismatch (new settings, retrained adapter) regenerates."""
+    w = sorted(adapter.glob("adapter_model.*")) if adapter else []
+    return {"max_new_tokens": e["max_new_tokens"], "adapter": str(adapter) if adapter else None,
+            "adapter_mtime": w[0].stat().st_mtime if w else None, "n": n}
+
+
 def eval_variant(cfg: dict, adapter: Path | None, held: list[dict], files: dict, out: Path, name: str) -> dict:
-    pred_path = out / f"predictions_{name}.jsonl"
-    if pred_path.exists():
-        return _summarise(read_jsonl(pred_path))
-    model, tok = load_student_for_inference(cfg, adapter)
     e = cfg["eval"]
+    pred_path = out / f"predictions_{name}.jsonl"
+    meta_path = out / f"predictions_{name}.meta.json"
+    key = _cache_key(e, adapter, len(held))
+    if pred_path.exists() and meta_path.exists():
+        meta = read_json(meta_path)
+        if meta.get("key") == key:  # resume: this variant was already scored with the same settings
+            s = _summarise(read_jsonl(pred_path))
+            if meta.get("latency"):
+                s["latency"] = meta["latency"]
+            return s
+    log.info("evaluate %s: generating predictions", name)
+    model, tok = load_student_for_inference(cfg, adapter)
     order = sorted(range(len(held)), key=lambda i: len(held[i]["prefix"]) + len(held[i]["suffix"]))
     preds: list[str] = [""] * len(held)
     for b in chunks(order, e.get("gen_batch_size", 32)):
@@ -49,11 +66,13 @@ def eval_variant(cfg: dict, adapter: Path | None, held: list[dict], files: dict,
     rows = [{"id": h["id"], "span_type": h["span_type"], "pred": p, **score(p, h, files[h["file_id"]])} for h, p in zip(held, preds)]
     write_jsonl(pred_path, rows)
     lat = measure_ttft(model, tok, held[: e.get("latency_prompts", 50)]) if name == "final" else None
+    write_json(meta_path, {"key": key, "latency": lat})
     model = None
     free_gpu()
     s = _summarise(rows)
     if lat:
         s["latency"] = lat
+    log.info("evaluate %s: exact_match=%s edit_similarity=%s parse_rate=%s", name, s["exact_match"], s["edit_similarity"], s["parse_rate"])
     return s
 
 
@@ -78,15 +97,35 @@ def measure_ttft(model, tok, rows: list[dict]) -> dict:
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"}
 
 
-def run_humaneval(merged: Path, out: Path) -> dict:
-    """HumanEval+ via evalplus (plain completion, greedy). Best effort: returns a reason on failure."""
+def run_humaneval(merged: Path, out: Path, timeout_s: int = 3600) -> dict:
+    """HumanEval+ via evalplus (plain completion, greedy). Best effort: returns a reason on failure.
+
+    Output is streamed to the console and to evalplus.log as it runs (it can take tens of minutes).
+    """
+    log_path = out / "evalplus.log"
+    log.info("HumanEval+: running evalplus (timeout %ds, log %s)", timeout_s, log_path)
+    t0 = time.time()
     try:
-        res = subprocess.run(
-            [sys.executable, "-m", "evalplus.evaluate", "--model", str(merged), "--dataset", "humaneval",
-             "--backend", "hf", "--greedy", "--root", str(out / "evalplus"), "--force-base-prompt"],
-            capture_output=True, text=True, timeout=3600,
-        )
-        (out / "evalplus.log").write_text(res.stdout + "\n" + res.stderr)
+        with open(log_path, "w") as lf:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", "-m", "evalplus.evaluate", "--model", str(merged), "--dataset", "humaneval",
+                 "--backend", "hf", "--greedy", "--root", str(out / "evalplus"), "--force-base-prompt"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+            watchdog = threading.Timer(timeout_s, proc.kill)  # fires even if evalplus goes quiet
+            watchdog.start()
+            try:
+                for line in proc.stdout:  # type: ignore[union-attr]
+                    lf.write(line)
+                    lf.flush()
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                proc.wait()
+            finally:
+                watchdog.cancel()
+        if time.time() - t0 >= timeout_s:
+            return {"status": "skipped", "reason": f"timed out after {timeout_s}s; see evalplus.log"}
+        log.info("HumanEval+: evalplus finished in %.0fs (exit %s)", time.time() - t0, proc.returncode)
         files = sorted((out / "evalplus").rglob("*eval_results.json"))
         if not files:
             return {"status": "skipped", "reason": "evalplus produced no results; see evalplus.log"}
@@ -111,8 +150,11 @@ def apply_gates(cfg: dict, m: dict) -> dict:
     if g.get("beats_base", True):
         checks["beats_base"] = {"value": final["edit_similarity"], "base": base["edit_similarity"],
                                 "pass": final["edit_similarity"] > base["edit_similarity"]}
-    checks["parse_rate"] = {"value": final["parse_rate"], "threshold": g.get("min_parse_rate", 0.98),
-                            "pass": final["parse_rate"] >= g.get("min_parse_rate", 0.98)}
+    # relative to the teacher (a student cannot be expected to out-parse it), with an absolute floor
+    p_thr = g.get("min_parse_rate", 0.80)
+    if teacher.get("parse_rate") is not None and "max_parse_drop_vs_teacher" in g:
+        p_thr = max(p_thr, teacher["parse_rate"] - g["max_parse_drop_vs_teacher"])
+    checks["parse_rate"] = {"value": final["parse_rate"], "threshold": round(p_thr, 4), "pass": final["parse_rate"] >= p_thr}
     ttft = final.get("latency", {}).get("ttft_ms_p50")
     if ttft is not None and "max_ttft_ms_t4" in g:
         checks["ttft"] = {"value": ttft, "threshold": g["max_ttft_ms_t4"], "pass": ttft <= g["max_ttft_ms_t4"]}
@@ -121,6 +163,8 @@ def apply_gates(cfg: dict, m: dict) -> dict:
 
 def run(run: Run) -> dict:
     cfg = run.cfg
+    if cfg["task"] != "fim":
+        return tasks.get(cfg["task"]).evaluate(run)
     out = run.step_dir(STEP)
     held = read_jsonl(run.step_dir("prepare") / "heldout.jsonl")
     files = {f["file_id"]: f["content"] for f in iter_jsonl(run.step_dir("prepare") / "files.jsonl")}
@@ -136,8 +180,10 @@ def run(run: Run) -> dict:
         "final_adapter": str(final_adapter),
     }
     if cfg["eval"].get("humaneval", False):
+        log.info("evaluate: merging final adapter for HumanEval+")
         merged = merge_and_save(cfg, final_adapter, run.run_dir / "merged")
-        metrics["humaneval"] = run_humaneval(merged, out)
+        metrics["humaneval"] = run_humaneval(merged, out, cfg["eval"].get("humaneval_timeout_s", 3600))
+        log.info("HumanEval+: %s", metrics["humaneval"])
     metrics["gates"] = apply_gates(cfg, metrics)
     write_json(out / "metrics.json", metrics)
     log.info("evaluate: verdict=%s final=%s teacher=%s base=%s", metrics["gates"]["verdict"],

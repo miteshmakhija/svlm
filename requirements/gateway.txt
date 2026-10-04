@@ -1,0 +1,6 @@
+# CPU serving of the model store (gateway/app.py). The extra index has prebuilt CPU wheels for llama-cpp-python.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+fastapi>=0.110
+uvicorn>=0.29
+pyyaml>=6.0
+llama-cpp-python>=0.3.8

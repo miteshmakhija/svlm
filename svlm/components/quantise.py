@@ -60,6 +60,38 @@ def to_awq(merged: Path, out: Path) -> dict:
     return {"dir": "awq", "scheme": "W4A16"}
 
 
+def cpu_latency(gguf: Path, prompts: list[str], threads: int | None, n_ctx: int = 2048) -> dict:
+    """Time to first token of the GGUF on CPU with llama.cpp, batch 1: how the gateway serves it.
+
+    Colab's CPU is not the serving machine, so treat the number as indicative; the gateway logs
+    the real one for every request.
+    """
+    try:
+        from llama_cpp import Llama
+    except ImportError:
+        log.info("installing llama-cpp-python (CPU wheel) for the latency check")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--prefer-binary", "llama-cpp-python>=0.3.8",
+                        "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/cpu"], check=True)
+        from llama_cpp import Llama
+    import statistics
+    import time
+
+    threads = threads or os.cpu_count() or 4
+    llm = Llama(model_path=str(gguf), n_ctx=n_ctx, n_threads=threads, verbose=False)
+    times = []
+    for i, p in enumerate(prompts):
+        llm.reset()  # no prompt-cache reuse between prompts: measure a cold prefill each time
+        t0 = time.perf_counter()
+        for _ in llm.create_completion(prompt=p, max_tokens=1, temperature=0.0, stream=True):
+            break
+        if i >= 2:  # warm-up
+            times.append((time.perf_counter() - t0) * 1000)
+    del llm
+    times.sort()
+    return {"ttft_ms_p50": round(statistics.median(times), 1), "ttft_ms_p90": round(times[int(0.9 * (len(times) - 1))], 1),
+            "n": len(times), "threads": threads, "device": f"{threads} CPU threads on the build machine"}
+
+
 def run(run: Run) -> dict:
     cfg = run.cfg
     q = cfg.get("quantise", {})
@@ -74,6 +106,14 @@ def run(run: Run) -> dict:
         info["gguf"] = to_gguf(merged, out, q["gguf_outtype"], run.root / "cache")
     if q.get("awq"):
         info["awq"] = to_awq(merged, out)
+    if q.get("cpu_latency") and "gguf" in info:
+        from ..fim import fim_prompt
+        from ..utils import read_jsonl
+
+        held = read_jsonl(run.step_dir("prepare") / "heldout.jsonl")[: q.get("cpu_latency_prompts", 22)]
+        info["cpu_latency"] = cpu_latency(out / info["gguf"]["file"], [fim_prompt(r["prefix"], r["suffix"]) for r in held],
+                                          q.get("cpu_threads"), cfg["student"].get("max_seq_len", 2048))
+        log.info("quantise: CPU latency %s", info["cpu_latency"])
     write_json(out / "summary.json", info)
     log.info("quantise: %s", info)
     return info

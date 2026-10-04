@@ -23,11 +23,64 @@ STEP = "register"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 USE = {
+    "code": ("One Python coder for the IDE: inline completion (fill-in-the-middle) and chat (write, explain, document "
+             "and fix code).",
+             "Long multi-file refactors, non-Python languages, anything outside code.",
+             "Trained on public BSD/Apache Python, MBPP and teacher-written problems; no MSCI code yet. Chat answers are "
+             "checked by tests in training only where tests exist. Inherits teacher mistakes on accepted answers."),
     "fim": ("Inline code completion inside the IDE (fill-in-the-middle), Python first.",
             "Chat, explanations, multi-file refactors (use msci-code-deep), anything outside code.",
             "Trained on public BSD/Apache Python only; no MSCI code yet. Short completions (<= 12 lines). "
             "Inherits teacher mistakes on spans where the teacher was accepted."),
 }
+
+
+SERVING = {
+    "fim": "Recommended settings: temperature 0, max new tokens 64, stop on `<|endoftext|>` and FIM tokens.",
+    "code": ("Recommended settings: inline completion as for msci-code-fast (FIM prompt, temperature 0, max new tokens 64); "
+             "chat with ChatML and the system prompt in `svlm/chat.py`, temperature 0-0.2, stop on `<|im_end|>`."),
+}
+
+
+def _latency_lines(gpu: dict, cpu: dict) -> str:
+    lines = []
+    if gpu:
+        lines.append(f"Latency (batch 1, {gpu.get('device', 'GPU')}): time to first token p50 {gpu.get('ttft_ms_p50', 'n/a')} ms, "
+                     f"p90 {gpu.get('ttft_ms_p90', 'n/a')} ms.")
+    if cpu:
+        lines.append(f"Latency (GGUF on CPU, {cpu.get('device', 'CPU')}): time to first token p50 {cpu.get('ttft_ms_p50')} ms, "
+                     f"p90 {cpu.get('ttft_ms_p90')} ms.")
+    return "\n\n".join(lines) or "Latency: not measured."
+
+
+def _table(rows: list[tuple[str, dict]]) -> str:
+    out = ["| Model | Exact match | Edit similarity | Parse rate |", "|---|---|---|---|"]
+    out += [f"| {n} | {_fmt(x.get('exact_match'))} | {_fmt(x.get('edit_similarity'))} | {_fmt(x.get('parse_rate'))} |" for n, x in rows]
+    return "\n".join(out)
+
+
+def results_section(cfg: dict, m: dict, cpu: dict, he: dict) -> str:
+    """The card's Results block for this task."""
+    humaneval = (f"pass@1 {he.get('humaneval_pass@1')} (HumanEval+ {he.get('humaneval_plus_pass@1')})" if he.get("status") == "ok"
+                 else f"not run ({he.get('reason', 'disabled')})")
+    f, b, t, s = m["final"], m["base"], m["teacher"], m.get("sft") or {}
+    if cfg["task"] == "fim":
+        table = _table([("Teacher", t), ("Student, untrained", b), ("Student, SFT", s), ("**Student, final**", f)])
+        return (f"## Results (held-out set, n = {f.get('n')})\n\n{table}\n\n"
+                f"{_latency_lines(f.get('latency', {}), cpu)}\n\nHumanEval+: {humaneval}")
+    # code: FIM table (with the reference FIM model when comparable) + chat table
+    ref = m.get("fim_reference", {})
+    fim_rows = [(f"Reference: {cfg['gates'].get('fim_reference_model')}:{ref.get('version')}", ref)] if ref.get("status") == "ok" else []
+    fim_rows += [("Student, untrained", b["fim"]), ("Student, SFT", s.get("fim", {})), ("**Student, final**", f["fim"])]
+    types = sorted(t["chat"].get("by_type", {}))
+    chat_rows = [("Teacher", t["chat"]), ("Student, untrained", b["chat"]), ("Student, SFT", s.get("chat", {})), ("**Student, final**", f["chat"])]
+    chat = ["| Model | pass@1 | " + " | ".join(types) + " |", "|---|---|" + "---|" * len(types)]
+    chat += [f"| {n} | {_fmt(x.get('pass@1'))} | " + " | ".join(_fmt(x.get("by_type", {}).get(k)) for k in types) + " |"
+             for n, x in chat_rows]
+    chat_table = "\n".join(chat)
+    return (f"## Results: inline completion (held-out FIM spans, n = {f['fim'].get('n')})\n\n{_table(fim_rows)}\n\n"
+            f"## Results: chat (held-out problems, tests run in a sandbox, n = {f['chat'].get('n')})\n\n{chat_table}\n\n"
+            f"{_latency_lines(f['fim'].get('latency', {}), cpu)}\n\nHumanEval+: {humaneval}")
 
 
 class _Safe(dict):
@@ -62,12 +115,18 @@ def update_catalogue(store: Path, name: str, tag: str, entry: dict, make_live: b
 def run(run: Run) -> dict:
     cfg = run.cfg
     metrics = read_json(run.step_dir("evaluate") / "metrics.json")
+    q = read_json(run.step_dir("quantise") / "summary.json")
+    cpu = q.get("cpu_latency") or {}
+    g = cfg.get("gates", {})
+    if cpu.get("ttft_ms_p50") is not None and "max_ttft_ms_cpu" in g:
+        metrics["gates"]["checks"]["ttft_cpu"] = {"value": cpu["ttft_ms_p50"], "threshold": g["max_ttft_ms_cpu"],
+                                                  "pass": cpu["ttft_ms_p50"] <= g["max_ttft_ms_cpu"]}
+        metrics["gates"]["verdict"] = "pass" if all(c["pass"] for c in metrics["gates"]["checks"].values()) else "fail"
     verdict = metrics["gates"]["verdict"]
     force = cfg.get("register", {}).get("force", False)
     if verdict != "pass" and not force:
         raise RuntimeError("release gates failed; fix and re-run, or set register.force=true to register as non-live")
 
-    q = read_json(run.step_dir("quantise") / "summary.json")
     prep = read_json(run.step_dir("prepare") / "manifest.json")
     filt = read_json(run.step_dir("verify") / "filter_report.json")
     dest = run.model_store / cfg["name"] / run.tag
@@ -81,6 +140,7 @@ def run(run: Run) -> dict:
     merged = Path(q["merged"])
     if merged.exists() and not (dest / "merged").exists():
         shutil.copytree(merged, dest / "merged")
+    if (dest / "merged").exists():  # list it on re-registration too, not only when first copied
         artefacts.append(("merged/ (fp16, for vLLM)", sum(p.stat().st_size for p in (dest / "merged").rglob("*") if p.is_file())))
     write_json(dest / "metrics.json", metrics)
 
@@ -94,8 +154,6 @@ def run(run: Run) -> dict:
     }
     write_json(dest / "lineage.json", lineage)
 
-    f, b, t, s = metrics["final"], metrics["base"], metrics["teacher"], metrics.get("sft") or {}
-    lat = f.get("latency", {})
     he = metrics.get("humaneval", {})
     use = USE.get(cfg["task"], ("", "", ""))
     gate_rows = ["| Check | Value | Threshold | Result |", "|---|---|---|---|"] + [
@@ -108,18 +166,11 @@ def run(run: Run) -> dict:
     fields = _Safe(
         name=cfg["name"], tag=run.tag, owner=cfg.get("owner", ""), tier=cfg["tier"], task=cfg["task"],
         student=cfg["student"]["model"], teacher=cfg["teacher"]["model"],
-        method="SFT on original + verified teacher completions, then offline top-k logit distillation",
+        method=cfg.get("method", "SFT on original + verified teacher completions, then offline top-k logit distillation"),
         verdict=verdict.upper() + (" (forced)" if verdict != "pass" else ""),
         registered_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         intended_use=use[0], out_of_scope=use[1], limitations=use[2],
-        n_heldout=f.get("n"),
-        teacher_em=_fmt(t.get("exact_match")), teacher_es=_fmt(t.get("edit_similarity")), teacher_parse=_fmt(t.get("parse_rate")),
-        base_em=_fmt(b.get("exact_match")), base_es=_fmt(b.get("edit_similarity")), base_parse=_fmt(b.get("parse_rate")),
-        sft_em=_fmt(s.get("exact_match")), sft_es=_fmt(s.get("edit_similarity")), sft_parse=_fmt(s.get("parse_rate")),
-        final_em=_fmt(f.get("exact_match")), final_es=_fmt(f.get("edit_similarity")), final_parse=_fmt(f.get("parse_rate")),
-        ttft_p50=lat.get("ttft_ms_p50", "n/a"), ttft_p90=lat.get("ttft_ms_p90", "n/a"), latency_device=lat.get("device", "n/a"),
-        humaneval=(f"pass@1 {he.get('humaneval_pass@1')} (HumanEval+ {he.get('humaneval_plus_pass@1')})" if he.get("status") == "ok"
-                   else f"not run ({he.get('reason', 'disabled')})"),
+        results_section=results_section(cfg, metrics, cpu, he), serving_notes=SERVING.get(cfg["task"], ""),
         gate_table="\n".join(gate_rows), data_table="\n".join(data_rows),
         decontam=f"{prep['decontam_dropped']}", teacher_filter=f"{filt['teacher_train_filter']}",
         artefact_rows="\n".join(f"| {n} | `{n.split(' ')[0]}` | {sz / 1e6:.0f} MB |" for n, sz in artefacts),

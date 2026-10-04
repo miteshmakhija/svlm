@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import random
 
+from .. import tasks
 from ..config import Run
 from ..fim import STOP_STRINGS, fim_prompt, trim_completion
 from ..modeling import free_gpu, generate_batch, load_causal_lm, load_tokenizer
@@ -67,6 +68,8 @@ def make_generator(cfg: dict):
 
 def run(run: Run) -> dict:
     cfg = run.cfg
+    if cfg["task"] != "fim":
+        return tasks.get(cfg["task"]).teacher_generate(run)
     prep = run.step_dir("prepare")
     out = run.step_dir(STEP)
     held = read_jsonl(prep / "heldout.jsonl")

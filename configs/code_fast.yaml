@@ -73,8 +73,8 @@ train:
     target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
     learning_rate: 2.0e-4
     epochs: 1
-    per_device_batch: 8
-    grad_accum: 4
+    per_device_batch: 2           # logits are seq x 152k vocab: 8 x 1024 needs ~18 GB; 2 fits T4 and L4
+    grad_accum: 16                # effective batch stays 32
     warmup_ratio: 0.03
     save_steps: 100
   kd:
@@ -82,20 +82,22 @@ train:
     temperature: 1.0
     learning_rate: 1.0e-4
     epochs: 1
-    per_device_batch: 8
-    grad_accum: 4
+    per_device_batch: 2           # logits are seq x 152k vocab: 8 x 1024 needs ~18 GB; 2 fits T4 and L4
+    grad_accum: 16                # effective batch stays 32
     save_steps: 100
 
 eval:
   gen_batch_size: 32
-  max_new_tokens: 64
+  max_new_tokens: 128             # same budget as teacher.gen, so parse/quality compare like for like
   humaneval: true                 # via evalplus; skipped with a warning if unavailable
+  humaneval_timeout_s: 3600       # evalplus (hf backend) can take most of an hour
   latency_prompts: 50
 
 gates:
   quality_vs_teacher: 0.85        # student edit-similarity >= 85% of teacher's
   beats_base: true
-  min_parse_rate: 0.98
+  max_parse_drop_vs_teacher: 0.05  # student parse rate >= teacher's - 0.05 ...
+  min_parse_rate: 0.80            # ... and never below this floor
   max_ttft_ms_t4: 150
 
 quantise:

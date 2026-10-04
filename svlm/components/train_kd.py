@@ -16,6 +16,9 @@ STEP = "train_kd"
 
 def run(run: Run) -> dict:
     cfg = run.cfg
+    if not cfg["train"].get("kd", {}).get("enabled", True):
+        log.info("%s skipped: train.kd.enabled=false", STEP)
+        return {"skipped": "train.kd.enabled=false"}
     out = run.step_dir(STEP)
     sft_adapter = run.step_dir("train_sft") / "adapter"
     if not sft_adapter.exists():

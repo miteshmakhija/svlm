@@ -17,7 +17,7 @@ import random
 import subprocess
 from pathlib import Path
 
-from .. import decontam
+from .. import decontam, tasks
 from ..config import Run
 from ..fim import build_samples
 from ..utils import log, sha256_file, stable_id, write_json, write_jsonl
@@ -62,12 +62,10 @@ def collect_files(src: dict, checkout: Path, exclude: list[str], max_bytes: int)
     return out
 
 
-def run(run: Run) -> dict:
-    cfg = run.cfg
-    d = cfg["data"]
-    out = run.step_dir(STEP)
+def collect_sources(run: Run) -> tuple[list[dict], dict]:
+    """Clone every configured repository at its pinned ref and collect matching source files."""
+    d = run.cfg["data"]
     cache = run.root / "cache" / "repos"
-
     files: list[dict] = []
     commits = {}
     for src in d["sources"]:
@@ -79,30 +77,36 @@ def run(run: Run) -> dict:
         files.extend(got)
     if not files:
         raise RuntimeError("no source files collected; check data.sources include patterns")
+    return files, commits
 
-    # split by file, so held-out code is never seen in training
-    rng = random.Random(cfg.get("seed", 42))
+
+def split_files(files: list[dict], fim: dict, seed: int) -> tuple[list[dict], list[dict]]:
+    """Held-out / train split by file (shuffles `files` in place, as the M1 runs did)."""
+    rng = random.Random(seed)
     rng.shuffle(files)
-    fim = d["fim"]
-    n_train, n_held = fim["n_train"], fim["n_heldout"]
-    held_share = n_held / (n_train + n_held)
+    held_share = fim["n_heldout"] / (fim["n_train"] + fim["n_heldout"])
     n_held_files = max(1, int(len(files) * held_share))
-    held_files, train_files = files[:n_held_files], files[n_held_files:]
+    return files[:n_held_files], files[n_held_files:]
 
+
+def decontam_index(d: dict) -> tuple[dict | set, int]:
+    dc = d.get("decontam", {})
+    n = dc.get("ngram", 13)
+    return decontam.build_index(decontam.load_eval_texts(dc.get("eval_sets", [])), n), n
+
+
+def fim_samples(train_files: list[dict], held_files: list[dict], fim: dict, seed: int, index, n: int):
+    """FIM train / held-out samples, decontaminated. Returns (train, held, dropped_train, dropped_held)."""
     common = dict(
         span_mix=fim["span_mix"],
         max_middle_lines=fim["max_middle_lines"],
         max_prefix_chars=fim["max_prefix_chars"],
         max_suffix_chars=fim["max_suffix_chars"],
-        seed=cfg.get("seed", 42),
+        seed=seed,
     )
     # draw extra, decontamination removes some
-    train = build_samples(train_files, int(n_train * 1.1), **common)
-    held = build_samples(held_files, int(n_held * 1.1), **common)
-
-    dc = d.get("decontam", {})
-    n = dc.get("ngram", 13)
-    index = decontam.build_index(decontam.load_eval_texts(dc.get("eval_sets", [])), n)
+    train = build_samples(train_files, int(fim["n_train"] * 1.1), **common)
+    held = build_samples(held_files, int(fim["n_heldout"] * 1.1), **common)
 
     def clean(rows):
         keep = [r for r in rows if not decontam.is_contaminated(r["prefix"] + r["middle"] + r["suffix"], index, n)]
@@ -110,7 +114,20 @@ def run(run: Run) -> dict:
 
     train, drop_t = clean(train)
     held, drop_h = clean(held)
-    train, held = train[:n_train], held[:n_held]
+    return train[: fim["n_train"]], held[: fim["n_heldout"]], drop_t, drop_h
+
+
+def run(run: Run) -> dict:
+    cfg = run.cfg
+    if cfg["task"] != "fim":
+        return tasks.get(cfg["task"]).prepare(run)
+    d = cfg["data"]
+    out = run.step_dir(STEP)
+    files, commits = collect_sources(run)
+    fim = d["fim"]
+    held_files, train_files = split_files(files, fim, cfg.get("seed", 42))
+    index, n = decontam_index(d)
+    train, held, drop_t, drop_h = fim_samples(train_files, held_files, fim, cfg.get("seed", 42), index, n)
 
     write_jsonl(out / "files.jsonl", files)
     write_jsonl(out / "train.jsonl", [{**r, "split": "train"} for r in train])

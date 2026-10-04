@@ -9,3 +9,5 @@ model_store/
 *.gguf
 *.safetensors
 *.npz
+.venv*/
+gateway/logs/

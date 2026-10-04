@@ -9,6 +9,7 @@ Outputs: sft.jsonl, teacher_heldout_scores.jsonl, filter_report.json
 """
 from __future__ import annotations
 
+from .. import tasks
 from ..config import Run
 from ..fim import parses_in_file, score
 from ..utils import iter_jsonl, log, read_jsonl, sha256_file, write_json, write_jsonl
@@ -30,6 +31,8 @@ def _mean(rows: list[dict], key: str) -> float:
 
 def run(run: Run) -> dict:
     cfg = run.cfg
+    if cfg["task"] != "fim":
+        return tasks.get(cfg["task"]).verify(run)
     prep, gen_dir, out = run.step_dir("prepare"), run.step_dir("teacher_generate"), run.step_dir(STEP)
     files = {f["file_id"]: f["content"] for f in iter_jsonl(prep / "files.jsonl")}
     train = {r["id"]: r for r in read_jsonl(prep / "train.jsonl")}

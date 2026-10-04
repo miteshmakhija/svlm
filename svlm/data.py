@@ -10,19 +10,24 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .chat import split_for_training
 from .fim import EOS, fim_prompt
 
 
-def prompt_text(row: dict, task: str) -> str:
-    if task == "fim":
-        return fim_prompt(row["prefix"], row["suffix"])
-    raise NotImplementedError(f"task {task} arrives in a later milestone")
+def prompt_and_target(row: dict) -> tuple[str, str]:
+    """Training text for one SFT row. Rows are FIM spans (prefix/suffix/target, the default) or chat
+    conversations (kind="chat", messages ending with the assistant reply)."""
+    if row.get("kind") == "chat":
+        return split_for_training(row["messages"])
+    return fim_prompt(row["prefix"], row["suffix"]), row["target"] + EOS
 
 
 def encode_example(tok, row: dict, task: str, max_len: int) -> dict | None:
-    """input_ids = prompt + target + EOS; labels mask the prompt. None if too long."""
-    p = tok(prompt_text(row, task), add_special_tokens=False)["input_ids"]
-    t = tok(row["target"] + EOS, add_special_tokens=False)["input_ids"]
+    """input_ids = prompt + target; labels mask the prompt, so loss is on the completion / reply only.
+    None if too long. `task` is kept for the call sites; the row itself says how to format it."""
+    prompt, target = prompt_and_target(row)
+    p = tok(prompt, add_special_tokens=False)["input_ids"]
+    t = tok(target, add_special_tokens=False)["input_ids"]
     if len(p) + len(t) > max_len or not t:
         return None
     return {"input_ids": p + t, "labels": [-100] * len(p) + t, "target_start": len(p), "id": row["id"]}

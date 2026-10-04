@@ -22,7 +22,8 @@ os.makedirs(SVLM_ROOT, exist_ok=True)
 def _find_repo():
     """Return the first folder that looks like the repo (has configs/ and svlm/), searching
     Colab's local disk and Drive, including one extra nesting level from zip/folder uploads."""
-    bases = ['/content/svlm-catalogue', REPO_ON_DRIVE, '/content/drive/MyDrive/svlm-catalogue', '/content/svlm', '/content']
+    # Drive first: re-running this cell then refreshes the local copy with whatever was synced to Drive
+    bases = [REPO_ON_DRIVE, '/content/drive/MyDrive/svlm-catalogue', '/content/svlm-catalogue', '/content/svlm', '/content']
     for b in bases:
         for cand in (b, os.path.join(b, 'svlm-catalogue')):
             if os.path.isdir(os.path.join(cand, 'configs')) and os.path.isdir(os.path.join(cand, 'svlm')):
@@ -69,12 +70,12 @@ def code(s):
     return nbf.v4.new_code_cell(s.strip())
 
 
-def notebook(cells):
+def notebook(cells, gpu="T4"):
     nb = nbf.v4.new_notebook()
     nb.cells = cells
     nb.metadata = {
         "accelerator": "GPU",
-        "colab": {"gpuType": "T4", "provenance": []},
+        "colab": {"gpuType": gpu, "provenance": []},
         "kernelspec": {"display_name": "Python 3", "name": "python3"},
         "language_info": {"name": "python"},
     }
@@ -108,32 +109,13 @@ Loads the teacher in 4-bit (bitsandbytes NF4, fp16 compute), checks memory, and 
 generation throughput on real FIM prompts.
 """),
         code(r'''
-import time, yaml
-from svlm.modeling import load_causal_lm, load_tokenizer, generate_batch, free_gpu
-from svlm.fim import fim_prompt
-
-cfg = yaml.safe_load(open('configs/code_fast.yaml'))
-name = cfg['teacher']['model']
-torch.cuda.reset_peak_memory_stats()
-t0 = time.time()
-tok = load_tokenizer(name)
-teacher = load_causal_lm(name, load_in_4bit=True)
-print(f'loaded {name} in {time.time()-t0:.0f}s, weights use {torch.cuda.memory_allocated()/1e9:.1f} GB')
-
-prefix = "import pandas as pd\n\ndef monthly_returns(prices: pd.Series) -> pd.Series:\n    \"\"\"Month-end simple returns.\"\"\"\n"
-suffix = "\n    return rets.dropna()\n"
-prompts = [fim_prompt(prefix, suffix)] * 16
-t0 = time.time()
-outs = generate_batch(teacher, tok, prompts, max_new_tokens=128)
-dt = time.time() - t0
-n_new = sum(len(tok(o, add_special_tokens=False)['input_ids']) for o in outs)
-print(f'batch of 16: {n_new} new tokens in {dt:.1f}s -> {n_new/dt:.0f} tokens/s | peak memory {torch.cuda.max_memory_allocated()/1e9:.1f} GB')
-print('--- sample completion ---')
-print(outs[0].split('<|endoftext|>')[0])
-TEACHER_TOK_PER_S = n_new / dt
-# drop the notebook's own references, or the kernel keeps ~5.5 GB and the pipeline OOMs
-del teacher, outs
-free_gpu()
+import subprocess, sys
+# separate process: when it exits the GPU is guaranteed empty for the pipeline below
+r = subprocess.run([sys.executable, 'tools/bench_teacher.py', '--config', 'configs/code_fast.yaml'],
+                   capture_output=True, text=True)
+print(r.stdout); print(r.stderr[-3000:] if r.returncode else '')
+r.check_returncode()
+TEACHER_TOK_PER_S = json.loads(r.stdout.strip().splitlines()[-1])['tokens_per_s']
 '''),
         md("""
 ## 3 · Full pipeline, tiny data, real models
@@ -151,7 +133,10 @@ register step run anyway so we can check the model card and catalogue entry.
         md("## 4 · Time and compute-unit estimate for the full run"),
         code(r'''
 from pathlib import Path
+import yaml
 from svlm.utils import read_json
+
+cfg = yaml.safe_load(open('configs/code_fast.yaml'))   # full-run settings to scale up to
 
 CU_PER_HOUR = 1.5   # read the real figure from Colab's Resources panel and edit this
 
@@ -321,8 +306,202 @@ your computer automatically; copy it into the gateway server's model store (for 
     return notebook(cells)
 
 
+def code_chat():
+    """02 · msci-code: one coder for inline completion and chat (L4, vLLM teacher)."""
+    def step(name, explain, after="", extra=""):
+        cells = [md(explain), code(f"!python pipelines/run_local.py --config configs/code.yaml {{SETS}} --steps {name}{extra}")]
+        if after:
+            cells.append(code(after))
+        return cells
+
+    cells = [
+        md("""
+# 02 · msci-code: one coder for completion and chat
+
+One **Qwen2.5-Coder-1.5B** student does both jobs in the IDE: inline completion (fill-in-the-middle) and
+chat (write, explain, document and fix Python). The teacher is **Qwen2.5-Coder-14B-Instruct-AWQ** on vLLM.
+`msci-code-fast` stays live for autocomplete until this model beats it on the same FIM spans.
+
+| SFT mix | Source | Target | Check |
+|---|---|---|---|
+| FIM (~2,500) | spans from the pinned repos, same as msci-code-fast | the original code | ground truth |
+| MBPP (~380) | MBPP train problems | teacher, 4 answers | MBPP's own tests |
+| synth (~2,000 seeds) | problems the teacher writes from real repo functions | teacher, 4 answers | reference passes its tests **and** ≥ 2 answers agree |
+| docstring (~600) | repo functions with docstrings removed | the original function | ground truth |
+| explain (~400) | repo functions | teacher | length rules |
+
+**Runtime: L4** (Runtime → Change runtime type → L4 GPU, High RAM on). Time estimates below are guesses
+until sections 2–3 measure them:
+
+| Step | What happens | L4 time (est.) |
+|---|---|---|
+| prepare | clone repos, FIM spans (identical to msci-code-fast), MBPP, repo functions | ~10 min |
+| teacher_generate | vLLM: write problems, 4 answers per problem, explanations | **section 3 projects it** (2–5 h guess) |
+| verify | run every answer against its tests in a sandbox | ~10–20 min |
+| teacher_logits / train_kd | skipped (`train.kd.enabled: false`; distillation hurt msci-code-fast) | – |
+| train_sft | bf16 LoRA r=32, 2 epochs | ~1 h |
+| evaluate | FIM (vs msci-code-fast) + chat pass@1 for base / SFT; gates | ~20 min |
+| quantise | merge, GGUF q8_0, CPU latency of the GGUF | ~10 min |
+| register | model store, model card, catalogue.yaml | <1 min |
+
+Every step resumes after a disconnect: re-run the setup cell, the variables cell and the same step cell.
+"""),
+        code(SETUP),
+        md("""
+## 0 · vLLM
+
+vLLM brings its own torch build. Install it once per runtime, then check that training libraries still import.
+If the install fails or breaks the check below, use the slow fallback instead: in section 4 add
+`--set teacher.backend=hf` (4-bit transformers; expect several times longer teacher steps).
+"""),
+        code(r'''
+!pip install -q -r requirements/vllm.txt
+!python -c "import vllm, torch, transformers, peft; print('vllm', vllm.__version__, '| torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| transformers', transformers.__version__)"
+'''),
+        md("## 1 · Unit tests (CPU: chat format, sandbox, problem parsing, verify, gates)"),
+        code("!python -m pytest -q tests/test_core.py tests/test_code_task.py"),
+        md("""
+## 2 · Pick the starting checkpoint
+
+Scores the **untrained** Base and Instruct 1.5B coders on msci-code-fast's held-out FIM spans and on MBPP
+validation (tests run in the sandbox). Training restores FIM easily (2,500 original spans in the mix); chat
+ability is harder to create from nothing, so prefer the better chat score unless its FIM score is far behind.
+~10 min.
+"""),
+        code("!python tools/compare_bases.py --config configs/code.yaml --n-fim 150"),
+        code(r'''
+# Set the starting checkpoint from the table above, then run this cell (and re-run it after any reconnect).
+STUDENT = 'Qwen/Qwen2.5-Coder-1.5B-Instruct'
+VERSION = '0.1.0'
+SETS = f'--set student.model={STUDENT} --set version={VERSION}'
+from pathlib import Path
+from svlm.utils import read_json, read_jsonl
+RUN = Path(SVLM_ROOT) / 'runs' / 'msci-code' / f'{VERSION}-l4'
+print(SETS)
+'''),
+        md("""
+## 3 · Teacher throughput
+
+Loads the 14B AWQ teacher in vLLM in its own process, answers 48 MBPP problems 4 times, and projects the
+full teacher step for this config. Use the projection to plan the session (Colab Pro sessions last up to 24 h,
+and every shard is saved, so a disconnect costs at most one shard).
+"""),
+        code("!python tools/bench_chat_teacher.py --config configs/code.yaml --problems 48"),
+        md("""
+## 4 · Smoke run (tiny data, real models, ~30–40 min)
+
+All steps with a few dozen examples per type, as `0.0.0-smoke`, so nothing touches the real run. Gates
+will fail at this size (and `fim_vs_reference` cannot compare: the smoke held-out spans differ);
+`register.force=true` registers it as non-live so the model card can be checked.
+"""),
+        code(r'''
+SMOKE = ('--set version=0.0.0 --set tier=smoke --set data.fim.n_train=200 --set data.fim.n_heldout=40 '
+         '--set data.code.fim_train=150 --set data.code.mbpp_max=40 --set data.code.synth_train=60 '
+         '--set data.code.synth_heldout=20 --set data.code.docstring=30 --set data.code.explain=20 '
+         '--set train.sft.epochs=1 --set register.force=true')
+!python pipelines/run_local.py --config configs/code.yaml --set student.model={STUDENT} {SMOKE}
+'''),
+        code(r'''
+smoke = Path(SVLM_ROOT) / 'model_store' / 'msci-code' / '0.0.0-smoke' / 'model_card.md'
+from IPython.display import Markdown, display
+display(Markdown(smoke.read_text()))
+'''),
+        md("""
+## 5 · Full run
+
+One cell per step. `teacher_generate` runs vLLM in a child process, so GPU memory is free again for training
+in the same session.
+"""),
+        code("!python pipelines/run_local.py --config configs/code.yaml {SETS} --status"),
+        *step("prepare", "### prepare", r'''
+m = read_json(RUN / 'prepare' / 'manifest.json')
+print(json.dumps({k: m[k] for k in ('fim', 'chat_train', 'chat_heldout', 'decontam_dropped')}, indent=2))
+ex = [r for r in read_jsonl(RUN / 'prepare' / 'chat_train.jsonl') if r['type'] == 'synth_seed'][0]
+print('--- a repository function that seeds a teacher-written problem:', ex['path']); print(ex['code'])
+'''),
+        *step("teacher_generate", "### teacher_generate\nThe long step. Shards of 256 are saved to Drive as they finish."),
+        *step("verify", "### verify\nEvery teacher answer is run against its tests in a sandbox.", r'''
+r = read_json(RUN / 'verify' / 'filter_report.json')
+print(json.dumps({k: r[k] for k in ('teacher_train_filter', 'sft_mix', 'chat_eval', 'teacher_heldout')}, indent=2))
+row = next(x for x in read_jsonl(RUN / 'verify' / 'sft.jsonl') if x.get('type') == 'synth')
+print('--- user ---'); print(row['messages'][0]['content']); print('--- assistant (kept: passed the tests) ---'); print(row['messages'][1]['content'])
+'''),
+        *step("teacher_logits", "### teacher_logits\nSkipped unless `train.kd.enabled=true`."),
+        *step("train_sft", "### train_sft", r'''
+import matplotlib.pyplot as plt
+h = read_json(RUN / 'train_sft' / 'train_log.json')['log_history']
+pts = [(r['step'], r['loss']) for r in h if 'loss' in r]
+plt.plot(*zip(*pts)); plt.xlabel('step'); plt.ylabel('loss'); plt.title('train_sft'); plt.grid(alpha=.3); plt.show()
+'''),
+        *step("train_kd", "### train_kd\nSkipped unless `train.kd.enabled=true`."),
+        *step("evaluate", "### evaluate", r'''
+m = read_json(RUN / 'evaluate' / 'metrics.json')
+ref = m.get('fim_reference', {})
+print('FIM (same held-out spans as msci-code-fast)')
+if ref.get('status') == 'ok': print(f"  reference msci-code-fast:{ref['version']}  edit-sim {ref['edit_similarity']:.3f}")
+else: print('  reference:', ref.get('status'))
+for k in ('base', 'sft', 'final'):
+    f = m[k]['fim']; print(f"  {k:6s} exact {f['exact_match']:.3f}  edit-sim {f['edit_similarity']:.3f}  parse {f['parse_rate']:.3f}")
+print('Chat pass@1 (held-out problems, tests in sandbox)')
+print(f"  teacher {m['teacher']['chat']['pass@1']}  {m['teacher']['chat']['by_type']}")
+for k in ('base', 'sft', 'final'): print(f"  {k:7s} {m[k]['chat']['pass@1']}  {m[k]['chat']['by_type']}")
+print('\nGATES:', m['gates']['verdict'].upper())
+for k, v in m['gates']['checks'].items(): print(f"  {'PASS' if v['pass'] else 'FAIL'}  {k}: {v['value']} (threshold {v.get('threshold', v.get('base'))})")
+'''),
+        *step("quantise", "### quantise\nAlso measures time to first token of the GGUF on this machine's CPU (indicative: Colab's CPU is not your server).",
+              "print(json.dumps(read_json(RUN / 'quantise' / 'summary.json').get('cpu_latency'), indent=2))"),
+        *step("register", "### register\nFails on purpose if a gate failed; add `--set register.force=true` to store it as non-live.", r'''
+from IPython.display import Markdown, display
+display(Markdown((Path(SVLM_ROOT) / 'model_store' / 'msci-code' / f'{VERSION}-l4' / 'model_card.md').read_text()))
+print(open(Path(SVLM_ROOT) / 'model_store' / 'catalogue.yaml').read())
+'''),
+        md("## 6 · Try it: chat and inline completion with the merged model"),
+        code(r'''
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from svlm.chat import format_chat, trim_reply
+from svlm.fim import fim_prompt, trim_completion
+mdir = RUN / 'merged'
+tok = AutoTokenizer.from_pretrained(mdir); model = AutoModelForCausalLM.from_pretrained(mdir, dtype=torch.bfloat16).cuda()
+
+def ask(question, max_new_tokens=400):
+    ids = tok(format_chat([{'role': 'user', 'content': question}]), return_tensors='pt', add_special_tokens=False).to('cuda')
+    out = model.generate(**ids, max_new_tokens=max_new_tokens, do_sample=False)
+    return trim_reply(tok.decode(out[0][ids['input_ids'].shape[1]:]))
+
+print(ask('Write a function that returns the maximum drawdown of a pandas Series of prices.'))
+print('\n' + '=' * 60 + '\n')
+prefix = "import numpy as np\n\ndef sharpe_ratio(returns, rf=0.0, periods=252):\n"
+suffix = "\n    return mean / std * np.sqrt(periods)\n"
+ids = tok(fim_prompt(prefix, suffix), return_tensors='pt', add_special_tokens=False).to('cuda')
+out = model.generate(**ids, max_new_tokens=64, do_sample=False)
+print(prefix + '\033[92m' + trim_completion(tok.decode(out[0][ids['input_ids'].shape[1]:]), 'block', suffix) + '\033[0m' + suffix)
+'''),
+        md("""
+## 7 · Serve it from your machine
+
+1. Copy `MyDrive/svlm/model_store/` (the new `msci-code/` folder and `catalogue.yaml`) into
+   `C:\\projects\\TechFest\\model_store\\`.
+2. Restart the gateway. It loads every live model in `catalogue.yaml`: `msci-code-fast` and `msci-code`.
+3. In `~/.continue/config.yaml`, add the `msci-code` entry from `gateway/continue-config.yaml` (chat, edit,
+   apply). Move `autocomplete` to it only if its CPU latency is acceptable for you; `msci-code-fast` is about
+   3× faster.
+
+## Done when
+
+- [ ] vLLM installs and the training libraries still import
+- [ ] the starting checkpoint is chosen from section 2
+- [ ] the teacher projection fits your compute budget
+- [ ] the smoke run finishes all steps and its model card renders
+- [ ] the full run passes its gates (or the failures are understood) and is registered
+"""),
+    ]
+    return notebook(cells, gpu="L4")
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     nbf.write(smoke_test(), OUT / "00_smoke_test.ipynb")
     nbf.write(code_fast(), OUT / "01_code_fast.ipynb")
+    nbf.write(code_chat(), OUT / "02_code.ipynb")
     print("wrote", sorted(p.name for p in OUT.glob("*.ipynb")))

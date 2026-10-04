@@ -12,6 +12,7 @@ Completed steps are skipped (a `_SUCCESS` marker per step); use --force to redo 
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
 import traceback
@@ -52,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--set", action="append", default=[], help="override a config value, e.g. data.fim.n_train=300")
     ap.add_argument("--force", action="store_true", help="re-run steps even if marked done")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--in-child", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
 
     cfg = load_config(a.config, parse_overrides(a.set))
@@ -66,6 +68,15 @@ def main(argv: list[str] | None = None) -> int:
             continue
         log.info("=== %s ===", step)
         t0 = time.time()
+        if step == "teacher_generate" and cfg["teacher"].get("backend") == "vllm" and not a.in_child:
+            # vLLM does not reliably return GPU memory inside one process: run the step in a child
+            # process so training can follow in this one
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--config", a.config, "--steps", step, "--in-child"]
+            cmd += [x for s in a.set for x in ("--set", s)] + (["--force"] if a.force else [])
+            if subprocess.run(cmd).returncode != 0:
+                log.error("step %s failed (child process); fix and re-run (finished steps are kept)", step)
+                return 1
+            continue
         try:
             info = components.get(step).run(run)
         except Exception:

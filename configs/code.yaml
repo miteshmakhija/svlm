@@ -1,0 +1,132 @@
+# msci-code — one Python coder for inline completion (FIM) and chat
+# L4 tier (Colab Pro). Replaces msci-code-fast in the IDE once its gates pass; until then
+# msci-code-fast stays live for autocomplete. Every path is relative to the run root ($SVLM_ROOT).
+
+name: msci-code
+version: 0.1.0
+tier: l4
+task: code
+seed: 42
+owner: Mitesh Makhija
+method: >-
+  SFT on a mix of original FIM spans, original docstrings and teacher answers that passed tests
+  (MBPP's own, or teacher tests confirmed by independent solutions); logit distillation off
+
+paths:
+  root: /content/drive/MyDrive/svlm        # overridden by $SVLM_ROOT
+  model_store: model_store                  # relative to root unless absolute
+
+student:
+  # Instruct keeps chat; FIM is restored by the FIM share of the mix. Notebook 02 section 1 scores
+  # the untrained base and instruct checkpoints on FIM and chat; switch with --set student.model=...
+  model: Qwen/Qwen2.5-Coder-1.5B-Instruct
+  load_in_4bit: false        # 1.5B trains in bf16 LoRA on an L4 (use true on a T4)
+  max_seq_len: 2048
+
+teacher:
+  model: Qwen/Qwen2.5-Coder-14B-Instruct-AWQ   # ~10 GB in AWQ 4-bit; fits an L4 with room for the KV cache
+  backend: vllm                  # vllm | hf  (hf: 4-bit transformers, much slower; fallback only)
+  max_model_len: 4096
+  gpu_memory_utilization: 0.85
+  gen:
+    n_solutions: 4               # independent answers per train problem
+    temperature: 0.7             # sampling for the n answers; held-out answers are greedy
+    problem_temperature: 0.7     # variety in the problems written from repository functions
+    max_new_tokens: 768
+    shard_size: 256              # resumable: a disconnect costs at most one shard
+    batch_size: 8                # hf backend only
+  logits:
+    top_k: 20
+    batch_size: 4
+
+data:
+  # FIM inputs: IDENTICAL to configs/code_fast.yaml (sources, exclude, sizes, seed), so the FIM
+  # held-out spans are the same and msci-code is compared directly with msci-code-fast.
+  sources:
+    - repo: https://github.com/pandas-dev/pandas
+      ref: v2.2.3
+      license: BSD-3-Clause
+      include: ["pandas/core/*.py", "pandas/core/**/*.py"]
+    - repo: https://github.com/numpy/numpy
+      ref: v2.1.3
+      license: BSD-3-Clause
+      include: ["numpy/lib/*.py", "numpy/_core/*.py"]
+    - repo: https://github.com/scikit-learn/scikit-learn
+      ref: 1.5.2
+      license: BSD-3-Clause
+      include: ["sklearn/linear_model/*.py", "sklearn/preprocessing/*.py", "sklearn/metrics/*.py"]
+    - repo: https://github.com/psf/requests
+      ref: v2.32.3
+      license: Apache-2.0
+      include: ["src/requests/*.py"]
+  exclude: ["**/tests/**", "**/test_*.py", "**/conftest.py", "**/_version.py"]
+  max_file_bytes: 80000
+  fim:
+    n_train: 7500                # built as in msci-code-fast, then code.fim_train are sampled for the mix
+    n_heldout: 500
+    span_mix: {line: 0.40, block: 0.35, function_body: 0.25}
+    max_middle_lines: 12
+    max_prefix_chars: 2200
+    max_suffix_chars: 900
+  code:
+    fim_train: 2500              # FIM share of the SFT mix (original code as target)
+    mbpp: true                   # MBPP train+prompt for training, validation held out; test untouched (MBPP+)
+    mbpp_max: null               # cap on MBPP training problems (null = all 384; the smoke run uses fewer)
+    synth_train: 2000            # repository functions -> teacher-written problems with tests
+    synth_heldout: 150           # same, from held-out files (only those whose reference passes are kept)
+    docstring: 600               # "add a docstring": original docstring as target, no teacher
+    explain: 400                 # teacher explanations of repository functions
+    min_fn_lines: 5
+    max_fn_lines: 40
+    max_docstring_chars: 1200
+    max_explain_words: 250
+    min_agree: 2                 # synth problem kept if >= 2 of n_solutions independently pass its tests
+    test_timeout_s: 10
+  decontam:
+    ngram: 13
+    eval_sets: [humaneval, mbpp]
+
+train:
+  use_unsloth: auto
+  sft:
+    lora_r: 32
+    lora_alpha: 64
+    lora_dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    learning_rate: 1.0e-4
+    epochs: 2
+    per_device_batch: 2           # 2048 tokens x 152k vocab logits: keep per-device batch small
+    grad_accum: 16                # effective batch 32
+    warmup_ratio: 0.03
+    save_steps: 100
+  kd:
+    enabled: false                # made msci-code-fast slightly worse; re-test later as an ablation
+    alpha: 0.5
+    temperature: 1.0
+    learning_rate: 5.0e-5
+    epochs: 1
+    per_device_batch: 2
+    grad_accum: 16
+    save_steps: 100
+
+eval:
+  gen_batch_size: 32
+  max_new_tokens: 128             # FIM: same as msci-code-fast's evaluation, for a like-for-like comparison
+  chat_max_new_tokens: 512
+  chat_batch_size: 16
+  humaneval: false                # evalplus prompts do not use our chat format; chat pass@1 above covers this
+  latency_prompts: 50
+
+gates:
+  fim_reference_model: msci-code-fast   # live version, compared on the identical held-out spans
+  max_fim_drop_vs_reference: 0.02       # FIM edit similarity >= reference - 0.02
+  min_parse_rate: 0.80
+  chat_vs_teacher: 0.85                 # chat pass@1 >= 85% of the teacher's
+  max_chat_drop_vs_base: 0.02           # chat must not regress vs the untrained instruct checkpoint
+  # max_ttft_ms_cpu: 1500               # set once the first run has measured CPU latency (quantise step)
+
+quantise:
+  gguf_outtype: q8_0
+  awq: false
+  cpu_latency: true               # time to first token of the GGUF with llama.cpp on CPU
+  cpu_threads: null               # null = all cores of the build machine

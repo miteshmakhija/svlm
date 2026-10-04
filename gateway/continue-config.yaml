@@ -1,0 +1,44 @@
+# Continue (VS Code / JetBrains) -> local SVLM gateway. Copy to ~/.continue/config.yaml.
+# Start the gateway first:  .venv-gateway\Scripts\python -m uvicorn gateway.app:app --port 8000
+name: SVLM catalogue (local)
+version: 1.0.0
+schema: v1
+models:
+  - name: msci-code-fast (local)
+    provider: openai
+    model: msci-code-fast
+    apiBase: http://127.0.0.1:8000/v1
+    apiKey: local                      # the gateway has no auth yet (M5); any value works
+    roles: [autocomplete]
+    useLegacyCompletionsEndpoint: true # completion model: POST /v1/completions, not chat
+    contextLength: 2048                # gateway SVLM_N_CTX
+    promptTemplates:
+      # Qwen2.5-Coder FIM format, exactly as trained (svlm/fim.py)
+      autocomplete: "<|fim_prefix|>{{{prefix}}}<|fim_suffix|>{{{suffix}}}<|fim_middle|>"
+    defaultCompletionOptions:
+      temperature: 0
+      maxTokens: 64                    # matches the model card's serving recommendation
+      stop: ["<|endoftext|>", "<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>", "<|fim_pad|>", "<|file_sep|>", "<|repo_name|>"]
+    autocompleteOptions:
+      maxPromptTokens: 1024            # trained with ~640 prefix + ~256 suffix tokens
+      debounceDelay: 250
+      modelTimeout: 3000               # CPU: multi-line blocks take ~1 s; Continue's default is much shorter
+      onlyMyCode: true
+
+  # msci-code (notebook 02): chat, edit and apply. Add it once msci-code is in the model store and the
+  # gateway has been restarted (it loads every live model in catalogue.yaml). It can also take the
+  # autocomplete role (same FIM settings as above), but on CPU it is ~3x slower than msci-code-fast.
+  - name: msci-code (local)
+    provider: openai
+    model: msci-code
+    apiBase: http://127.0.0.1:8000/v1
+    apiKey: local
+    roles: [chat, edit, apply]
+    contextLength: 4096                # gateway SVLM_N_CTX
+    capabilities: []                   # no tool use / images: plain chat
+    chatOptions:
+      # the system prompt msci-code was trained with (svlm/chat.py DEFAULT_SYSTEM)
+      baseSystemMessage: "You are msci-code, a careful Python coding assistant. Answer concisely and put code in ```python blocks."
+    defaultCompletionOptions:
+      temperature: 0.1
+      maxTokens: 768

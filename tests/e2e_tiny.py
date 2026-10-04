@@ -15,7 +15,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-SPECIAL = ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|file_sep|>", "<|repo_name|>"]
+SPECIAL = ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|file_sep|>", "<|repo_name|>",
+           "<|im_start|>", "<|im_end|>"]
+# ChatML, so the tiny teacher works with the hf chat backend of the `code` task
+CHAT_TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n{% endfor %}"
+                 "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}")
 
 
 def make_tiny_models(work: Path, corpus_dir: Path) -> tuple[Path, Path]:
@@ -29,6 +33,7 @@ def make_tiny_models(work: Path, corpus_dir: Path) -> tuple[Path, Path]:
     tk.train(files, trainers.BpeTrainer(vocab_size=2000, special_tokens=SPECIAL, show_progress=False))
     tok = PreTrainedTokenizerFast(tokenizer_object=tk, eos_token="<|endoftext|>", pad_token="<|endoftext|>")
     tok.add_special_tokens({"additional_special_tokens": SPECIAL[1:]})
+    tok.chat_template = CHAT_TEMPLATE
 
     out = []
     for name, hidden, layers in (("student", 64, 2), ("teacher", 128, 3)):
@@ -43,7 +48,13 @@ def make_tiny_models(work: Path, corpus_dir: Path) -> tuple[Path, Path]:
 
 
 def main():
-    work = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tempfile.mkdtemp(prefix="svlm-e2e-"))
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workdir", nargs="?")
+    ap.add_argument("--task", default="fim", choices=["fim", "code"])
+    a = ap.parse_args()
+    work = Path(a.workdir) if a.workdir else Path(tempfile.mkdtemp(prefix="svlm-e2e-"))
     work.mkdir(parents=True, exist_ok=True)
     corpus = work / "cache" / "repos" / "requests-v2.32.3"
     if not corpus.exists():
@@ -62,7 +73,18 @@ def main():
         "eval.max_new_tokens=16", "eval.gen_batch_size=8", "eval.humaneval=false", "eval.latency_prompts=6",
         "quantise.gguf_outtype=null", "register.force=true",
     ]
-    cmd = [sys.executable, str(REPO / "pipelines" / "run_local.py"), "--config", str(REPO / "configs" / "code_fast.yaml")]
+    config, name = "code_fast.yaml", "msci-code-fast"
+    if a.task == "code":
+        config, name = "code.yaml", "msci-code"
+        sets += [
+            "teacher.backend=hf", "teacher.gen.n_solutions=2", "teacher.gen.shard_size=64", "teacher.gen.max_new_tokens=24",
+            "data.code.fim_train=20", "data.code.synth_train=6", "data.code.synth_heldout=4",
+            "data.code.docstring=5", "data.code.explain=4", "data.code.test_timeout_s=5",
+            "student.max_seq_len=1024", "train.sft.epochs=1",
+            "eval.chat_max_new_tokens=16", "eval.chat_batch_size=16", "gates.fim_reference_model=null",
+            "quantise.cpu_latency=false",
+        ]
+    cmd = [sys.executable, str(REPO / "pipelines" / "run_local.py"), "--config", str(REPO / "configs" / config)]
     for s in sets:
         cmd += ["--set", s]
     r = subprocess.run(cmd)
@@ -74,9 +96,10 @@ def main():
     assert r2.returncode == 0 and r2.stderr.count("skip ") == 9, r2.stderr[-2000:]
 
     store = work / "model_store"
-    card = store / "msci-code-fast" / "0.0.1-cpu-e2e" / "model_card.md"
+    card = store / name / "0.0.1-cpu-e2e" / "model_card.md"
     assert card.exists(), "model card missing"
-    assert "n/a" not in card.read_text().split("## Results")[1].split("Latency")[0], "results table incomplete"
+    for block in card.read_text().split("## Results")[1:]:
+        assert "n/a" not in block.split("Latency")[0].split("## Results")[0], "results table incomplete"
     assert (store / "catalogue.yaml").exists()
     print("\nE2E OK. Work dir:", work)
     print(card.read_text()[:1500])

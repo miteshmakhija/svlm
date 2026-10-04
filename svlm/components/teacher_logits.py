@@ -52,6 +52,9 @@ def topk_for_batch(model, feats: list[dict], pad_id: int, k: int) -> list[tuple[
 
 def run(run: Run) -> dict:
     cfg = run.cfg
+    if not cfg["train"].get("kd", {}).get("enabled", True):
+        log.info("%s skipped: train.kd.enabled=false", STEP)
+        return {"skipped": "train.kd.enabled=false"}
     t = cfg["teacher"]
     k = t["logits"]["top_k"]
     out = run.step_dir(STEP)

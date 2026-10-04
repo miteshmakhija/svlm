@@ -17,18 +17,7 @@
 
 **Out of scope:** {out_of_scope}
 
-## Results (held-out set, n = {n_heldout})
-
-| Model | Exact match | Edit similarity | Parse rate |
-|---|---|---|---|
-| Teacher | {teacher_em} | {teacher_es} | {teacher_parse} |
-| Student, untrained | {base_em} | {base_es} | {base_parse} |
-| Student, SFT | {sft_em} | {sft_es} | {sft_parse} |
-| **Student, final** | **{final_em}** | **{final_es}** | **{final_parse}** |
-
-Latency (batch 1, {latency_device}): time to first token p50 {ttft_p50} ms, p90 {ttft_p90} ms.
-
-HumanEval+: {humaneval}
+{results_section}
 
 ### Gate checks
 
@@ -40,7 +29,7 @@ HumanEval+: {humaneval}
 
 Decontamination: {decontam}
 
-Teacher completions on train spans: {teacher_filter}
+Teacher output filter: {teacher_filter}
 
 ## Serving
 
@@ -48,7 +37,7 @@ Teacher completions on train spans: {teacher_filter}
 |---|---|---|
 {artefact_rows}
 
-Recommended settings: temperature 0, max new tokens 64, stop on `<|endoftext|>` and FIM tokens.
+{serving_notes}
 
 ## Lineage
 
