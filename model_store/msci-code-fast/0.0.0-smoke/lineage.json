@@ -1,0 +1,33 @@
+{
+  "git_commit": "ac181d37201c5de7d3843efddc60239eca1c7a6e",
+  "config_hash": "9c57d81cb43d15cc",
+  "run_dir": "/content/drive/MyDrive/svlm/runs/msci-code-fast/0.0.0-smoke",
+  "sources": {
+    "https://github.com/pandas-dev/pandas": {
+      "ref": "v2.2.3",
+      "commit": "0691c5cf90477d3503834d983f69350f250a6ff7",
+      "license": "BSD-3-Clause"
+    },
+    "https://github.com/numpy/numpy": {
+      "ref": "v2.1.3",
+      "commit": "98464cc0cbc1f211482a0756ded305bed1599f18",
+      "license": "BSD-3-Clause"
+    },
+    "https://github.com/scikit-learn/scikit-learn": {
+      "ref": "1.5.2",
+      "commit": "156ef141f3b270edb06c8ae9af37c55253c0aabe",
+      "license": "BSD-3-Clause"
+    },
+    "https://github.com/psf/requests": {
+      "ref": "v2.32.3",
+      "commit": "0e322af87745eff34caffe4df68456ebc20d9068",
+      "license": "Apache-2.0"
+    }
+  },
+  "data_sha256": {
+    "train.jsonl": "135318e945e2a40f20aa980308a818d3bab600a1ee360de2810c83f4192b4c11",
+    "heldout.jsonl": "45576fb56ebe865815cf8695559765116fae3e038948fd8d8e1572b9c369cf8a",
+    "sft.jsonl": "4ab819e9450043f1a4e3e9c18827b1755fb52d1d185a8dba93c2d5eb8326f003"
+  },
+  "gguf_sha256": "0273dc26ca9f619481331d47acaa9aca534efa8fc276d1e2756a15195e56eaf1"
+}

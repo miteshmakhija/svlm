@@ -1,0 +1,20 @@
+models:
+  msci-code-fast:
+    live: 0.1.0-t4
+    versions:
+      0.0.0-smoke:
+        path: msci-code-fast/0.0.0-smoke
+        task: fim
+        gguf: model.q8_0.gguf
+        hf_dir: merged
+        verdict: fail
+        registered_at: '2026-10-04T06:33:53+00:00'
+        config_hash: 9c57d81cb43d15cc
+      0.1.0-t4:
+        path: msci-code-fast/0.1.0-t4
+        task: fim
+        gguf: model.q8_0.gguf
+        hf_dir: merged
+        verdict: pass
+        registered_at: '2026-10-04T11:29:21+00:00'
+        config_hash: 179768105e8928e8
